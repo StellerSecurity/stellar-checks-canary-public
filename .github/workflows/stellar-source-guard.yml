@@ -1,5 +1,5 @@
-# Stellar source guard v2.0.0. No repository checkout or package installation.
-# PR content is read as data by the trusted base-branch workflow.
+# Stellar source guard v2.1.0. Repository content is data only.
+# Package malware advisories and archives are checked by the separate commit worker.
 name: Repository source guard
 on:
   push:
@@ -22,12 +22,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - name: Read source and check dependency advisories
+      - name: Read source and lifecycle scripts
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          python3 -I - <<'STELLAR_GUARD_PY'
+          python3 -I -B - <<'STELLAR_GUARD_PY'
           """Stellar source guard. Python standard library only; source is never executed."""
           import base64
           import collections
@@ -44,7 +44,7 @@ jobs:
           import xml.etree.ElementTree as ET
           import zlib
           
-          VERSION = '2.0.0'
+          VERSION = '2.1.0'
           CHECK_NAME = 'Repository source guard'
           WORKFLOW_PATH = '.github/workflows/stellar-source-guard.yml'
           MAX_FILE = 2_000_000
@@ -65,11 +65,11 @@ jobs:
           class API:
               def __init__(self, token):
                   self.token = token
-                  self.opener = urllib.request.build_opener(NoRedirect)
+                  self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
           
               def call(self, url, data=None, method=None):
                   host = urllib.parse.urlsplit(url).netloc
-                  if host not in ('api.github.com', 'api.osv.dev') or not url.startswith('https://'):
+                  if host != 'api.github.com' or not url.startswith('https://'):
                       raise RuntimeError('API host is not allowed')
                   headers = {'User-Agent': 'Stellar-Source-Guard/' + VERSION, 'Content-Type': 'application/json'}
                   if host == 'api.github.com':
@@ -84,7 +84,7 @@ jobs:
                           return result
                       except (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected, http.client.IncompleteRead, ConnectionResetError):
                           if attempt == 2:
-                              raise RuntimeError('Advisory or GitHub API request failed') from None
+                              raise RuntimeError('GitHub API request failed') from None
                           time.sleep(2 ** attempt)
           
               def gh(self, path, data=None, method=None):
@@ -473,37 +473,13 @@ jobs:
           
           
           def advisory_scan(api, deps):
-              ids, malicious = set(), set()
-              items = sorted(deps)
-              for start in range(0, len(items), 150):
-                  batch = items[start:start + 150]
-                  queries = [{'package': {'ecosystem': eco, 'name': name}, 'version': version} for eco, name, version in batch]
-                  results = api.call('https://api.osv.dev/v1/querybatch', {'queries': queries})['results']
-                  if len(results) != len(batch):
-                      raise RuntimeError('Incomplete advisory results')
-                  for query, result in zip(queries, results):
-                      while True:
-                          for vuln in result.get('vulns', []):
-                              ids.add(vuln['id'])
-                              if vuln['id'].startswith('MAL-'):
-                                  malicious.add(vuln['id'])
-                          if not result.get('next_page_token'):
-                              break
-                          result = api.call('https://api.osv.dev/v1/query', dict(query, page_token=result['next_page_token']))
-              for eco, gh_eco in ECOSYSTEMS.items():
-                  matching = [d for d in items if d[0] == eco]
-                  for start in range(0, len(matching), 40):
-                      batch = matching[start:start + 40]
-                      page = 1
-                      while True:
-                          params = {'type': 'malware', 'ecosystem': gh_eco, 'is_withdrawn': 'false', 'affects': ','.join(n + '@' + v for _, n, v in batch), 'per_page': 100, 'page': page}
-                          result = api.gh('advisories?' + urllib.parse.urlencode(params))
-                          for item in result:
-                              malicious.add(item['ghsa_id'])
-                          if len(result) < 100:
-                              break
-                          page += 1
-              return ids, malicious
+              """No external coordinate queries; delegated to verified public-package analysis.
+          
+              Coordinates parsed from private repository manifests remain local to this
+              GitHub job. The separate package-content worker first verifies public registry
+              provenance before it sends any exact public coordinate to advisory services.
+              """
+              return set(), set()
           
           
           def markdown_safe(value):
@@ -579,19 +555,20 @@ jobs:
               findings.sort(key=lambda f: (f['level'] != 'error', not f.get('introduced', False), f['path'], f['rule'], f['line']))
               errors = sum(f['level'] == 'error' for f in findings)
               summary = ['# Repository source guard', '', 'Version: ' + VERSION, 'Commit: `' + sha + '`', '',
-                         '%d text files verified; %d exact dependency versions checked; %d blocking findings.' % (scanned, len(deps), errors),
-                         '%d known vulnerability advisory IDs (review warnings, including development dependencies).' % len(ids), '',
+                         '%d text files verified; %d exact dependency versions checked; %d blocking findings.' % (scanned, 0, errors),
+                         '0 known vulnerability advisory IDs (external dependency advisory lookups are delegated, not performed here).',
+                         '%d dependency coordinates parsed locally; only the separate package-content worker checks proven public coordinates and archives.' % len(deps), '',
                          ('Compared with `' + base_sha + '`: %d changed paths; %d new review findings.' % (len(changed), sum(f.get('introduced', False) for f in findings))) if before is not None else 'Full current-tree scan; no prior-commit comparison for this event.', '',
                          'Checks include bounded literal decoding, behavior correlations, lifecycle scripts and CI configuration. Review warnings are not proof of malicious intent.', '',
                          'Repository code, lifecycle scripts and dependencies were not executed or installed.',
-                         'This is a static source and advisory check, not a binary antivirus or a guarantee of safety.', '', '## Findings', '']
+                         'This is a static source and lifecycle check. Dependency advisories and package archives require the separate package-content result; this source-only result does not establish dependency coverage.', '', '## Findings', '']
               for f in findings[:150]:
                   summary.append('- **%s%s** %s:%d — %s' % (f['level'], ' NEW' if f.get('introduced') else '', markdown_safe(f['path']), f['line'], markdown_safe(f['rule'])))
               if len(findings) > 150:
                   summary.append('- Additional findings omitted from this summary: %d.' % (len(findings) - 150))
               if not findings:
                   summary.append('No source indicators were detected by the current rules.')
-              summary += ['', '## Vulnerability advisory IDs', '', ', '.join(sorted(ids)[:300]) or 'None.', '',
+              summary += ['', '## Vulnerability advisory IDs', '', 'Not queried here; delegated to the provenance-verified package-content worker.', '',
                           'Scope: selected source/configuration text up to 2 MB; secrets excluded; binary programs, submodules, other refs and unpinned/unsupported dependencies are not fully covered. Minified source is included. Decoding is limited to 2 layers, 32 literals and 1 MB per source file. Dependency package archives and registry provenance are not inspected. Heuristic correlations are not full interprocedural data-flow analysis.']
               return '\n'.join(summary), errors
           
