@@ -1,0 +1,3 @@
+Notification delivery test for the central GitHub App webhook.
+This branch intentionally contains no GitHub Actions workflow.
+This text file contains no executable code or secrets.
